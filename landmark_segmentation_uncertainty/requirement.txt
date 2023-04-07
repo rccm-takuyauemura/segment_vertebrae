@@ -1,0 +1,12 @@
+numpy==1.16.0
+vtk==9.0.1
+itk==5.1.1
+SimpleITK==1.2.4
+tensorflow-gpu==1.15.0
+opencv-python==4.4.0.42
+scipy==1.4.1
+scikit-image==0.16.2
+cachetools==5.2.0
+pyinstaller==4.7
+tornado==6.1
+protobuf==3.19.1
