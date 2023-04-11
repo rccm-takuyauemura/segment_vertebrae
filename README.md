@@ -1,6 +1,6 @@
 # segment_vertebrae
 ## explanation
-This toolkit is prepared for converting the vertebral segmentaion tool to one executable file included in the Windows software. If using this, please install PyInstaller in your environment (referring to requirment.txt).
+This toolkit was prepared for converting the vertebral segmentaion tool to one executable file included in the Windows software. If using this, please install PyInstaller in your environment (referring to requirment.txt).
 
 This is based on [vertebral-alignment-analysis-platform](https://github.com/zhuo-cheng/vertebral-alignment-analysis-platform), which refers to the following paper and toolkits:
 
