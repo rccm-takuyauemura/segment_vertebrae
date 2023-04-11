@@ -6,8 +6,7 @@ This is based on [vertebral-alignment-analysis-platform](https://github.com/zhuo
 
 - [Coarse to Fine Vertebrae Localization and Segmentation with SpatialConfiguration-Net and U-Net](https://cpb-ap-se2.wpmucdn.com/blogs.auckland.ac.nz/dist/1/670/files/2020/06/2020PayerVISAPP.pdf)
 - [MedicalDataAugmentationTool-VerSe](https://github.com/christianpayer/MedicalDataAugmentationTool-VerSe/tree/master/verse2019)
-
-In addition, [MedicalDataAugmentationTool](https://github.com/christianpayer/MedicalDataAugmentationTool) is used in this toolkit, as "vertebral-alignment-analysis-platform".
+- [MedicalDataAugmentationTool](https://github.com/christianpayer/MedicalDataAugmentationTool)
 
 ## make executable file
 In "inference" directory, type the following command;
