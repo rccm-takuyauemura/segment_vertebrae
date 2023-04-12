@@ -8,6 +8,16 @@ This is based on [vertebral-alignment-analysis-platform](https://github.com/zhuo
 - [MedicalDataAugmentationTool-VerSe](https://github.com/christianpayer/MedicalDataAugmentationTool-VerSe/tree/master/verse2019)
 - [MedicalDataAugmentationTool](https://github.com/christianpayer/MedicalDataAugmentationTool)
 
+
+### changes from "vertebral-alignment-analysis-platform"
+
+- merge several .py files into one "segment_vertebrae.py" file (because just one executable file would like to be created using PyInstaller)
+- give the file basename as an argument, and segment only the one spcified dataset (because in our software, just one .nii file would like to be segmented at a time)
+- give the used GPU NO. as an argument
+- watch the progress with the output .txt file
+- detect the memory allocation error
+- proper newline in intermediate .csv files on both Windows and Linux
+
 ## make executable file
 In "inference" directory, type the following command;
 
@@ -17,11 +27,3 @@ pyinstaller segment_vertebrae.py --additional-hooks-dir=hooks --onefile --add-da
 
 One executable file "segment_vertebrae.exe" is created in the new "dist" directory. 
 
-## changes from "vertebral-alignment-analysis-platform"
-
-- merge several .py files into one "segment_vertebrae.py" file (because just one executable file would like to be created using PyInstaller)
-- give the file basename as an argument, and segment only the one spcified dataset (because in our software, just one .nii file would like to be segmented at a time)
-- give the used GPU NO. as an argument
-- watch the progress with the output .txt file
-- detect the memory allocation error
-- proper newline in intermediate .csv files on both Windows and Linux
