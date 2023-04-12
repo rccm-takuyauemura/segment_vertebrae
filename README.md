@@ -25,5 +25,5 @@ In "inference" directory, type the following command;
 pyinstaller segment_vertebrae.py --additional-hooks-dir=hooks --onefile --add-data "..\MedicalDataAugmentationTool-master;."
 ```
 
-One executable file "segment_vertebrae.exe" is created in the new "dist" directory. 
+One executable file "segment_vertebrae.exe" is created in the new "dist" directory. Please refer to [PyInstaller Usage](https://pyinstaller.org/en/stable/usage.html)
 
