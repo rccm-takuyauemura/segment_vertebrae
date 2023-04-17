@@ -14,7 +14,7 @@ This is based on [vertebral-alignment-analysis-platform](https://github.com/zhuo
 - merge several .py files into one "segment_vertebrae.py" file (because just one executable file would like to be created using PyInstaller)
 - give the file basename as an argument, and segment only the one spcified dataset (because in our software, just one .nii file would like to be segmented at a time)
 - give the used GPU NO. as an argument
-- watch the progress with the output .txt file
+- output progress to .txt file
 - detect the memory allocation error
 - proper newline in intermediate .csv files on both Windows and Linux
 
