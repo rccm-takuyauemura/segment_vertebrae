@@ -12,14 +12,29 @@ a = Analysis(['segment_vertebrae.py'],
              hookspath=['hooks'],
              hooksconfig={},
              runtime_hooks=[],
-             excludes=[],
+             excludes=['cv2'],
              win_no_prefer_redirects=False,
              win_private_assemblies=False,
              cipher=block_cipher,
              noarchive=False)
 pyz = PYZ(a.pure, a.zipped_data,
              cipher=block_cipher)
-
+for d in a.datas:
+    if '_tensorflow_wrap_interpreter_wrapper.pyd' in d[0]:
+        a.datas.remove(d)
+        break
+for d in a.datas:
+    if '_tensorflow_lite_wrap_calibration_wrapper.pyd' in d[0]:
+        a.datas.remove(d)
+        break
+for d in a.datas:
+    if '_pywrap_tensorflow_internal.pyd' in d[0]:
+        a.datas.remove(d)
+        break
+for d in a.datas:
+    if '_tf_stack.pyd' in d[0]:
+        a.datas.remove(d)
+        break
 exe = EXE(pyz,
           a.scripts,
           a.binaries,

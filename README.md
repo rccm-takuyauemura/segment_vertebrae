@@ -11,19 +11,22 @@ This is based on [vertebral-alignment-analysis-platform](https://github.com/zhuo
 
 ### changes from "vertebral-alignment-analysis-platform"
 
-- merge several .py files into one "segment_vertebrae.py" file (because just one executable file would like to be created using PyInstaller)
-- give the file basename as an argument, and segment only the one spcified dataset (because in our software, just one .nii file would like to be segmented at a time)
-- give the used GPU NO. as an argument
+- merge several .py files into one "segment_vertebrae.py" file (to create one executable file with PyInstaller)
+- give the file basename as an argument, and segment only the specified dataset
+- input / output in MetaImage (.mhd/.raw) format (converted internally to / from NIfTI)
+- give the used GPU No. as an argument; check the NVIDIA driver and the GPU, and run on CPU if the GPU is not supported by this build
 - output progress to .txt file
-- detect the memory allocation error
+- reduce memory usage of the final label fusion (running argmax instead of a full multi-channel array; identical results)
+- return exit codes on errors (-1: general error / input not found, -3: out of memory, -4: spine/vertebrae not detected, -5: model file not found, -6: model load error, -8: NVIDIA driver too old)
+- remove intermediate files also on failure
 - proper newline in intermediate .csv files on both Windows and Linux
 
 ## make executable file
 In "inference" directory, type the following command;
 
 ```
-pyinstaller segment_vertebrae.py --additional-hooks-dir=hooks --onefile --add-data "..\MedicalDataAugmentationTool-master;."
+pyinstaller segment_vertebrae.spec"
 ```
 
-One executable file "segment_vertebrae.exe" is created in the new "dist" directory. Please refer to [PyInstaller Usage](https://pyinstaller.org/en/stable/usage.html).
+One executable file "segment_vertebrae.exe" is created in the "dist" directory. Please refer to [PyInstaller Usage](https://pyinstaller.org/en/stable/usage.html).
 
