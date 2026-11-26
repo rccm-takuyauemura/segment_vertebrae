@@ -1,4 +1,18 @@
 #!/usr/bin/python
+# ------------------------------------------------------------------------------------------------------------
+# Modified by RCCM, 2026-11:
+#   - Inference runs with ONNX Runtime on the CPU instead of TensorFlow 1.15 (MainLoopOnnx, MainLoop1/2/3).
+#     The models are '<prefix>.onnx' files converted from the TensorFlow checkpoints with
+#     freeze_vertebrae_onnx.py and convert_pb_to_onnx.py.
+#   - The GPU / NVIDIA driver check is removed (CPU only); --gpu is accepted and ignored.
+#   - The random seed of the MC dropout is fixed (ONNX_RANDOM_SEED), so the same CT gives the same result.
+#   - Options for evaluation: --mc_runs N (number of MC dropout runs per vertebra, default 10), --seed S (random
+#     seed, default ONNX_RANDOM_SEED), --no_dropout (stage 3 without dropout, one run per vertebra, with the
+#     model '<prefix>_nodropout.onnx').
+#   - Stage 3 speed-up with the same result: the prediction of each vertebra is resampled and compared only inside
+#     the region of the input image that its patch covers (patch_region_in_input), not over the whole image;
+#     the CT image is loaded and smoothed once for all vertebrae instead of once per vertebra.
+# ------------------------------------------------------------------------------------------------------------
 import sys
 import csv
 sys.path.append('../MedicalDataAugmentationTool-master')
@@ -9,23 +23,20 @@ import argparse
 from collections import OrderedDict
 from glob import glob
 from glob import escape as glob_escape
-import ctypes
 
 import SimpleITK as sitk
 import numpy as np
 import os
 import traceback
-import tensorflow as tf
+import onnxruntime as ort
 
 import utils.io.image
 import utils.io.text
 import utils.sitk_image
 import utils.sitk_np
 from dataset import Dataset
-#from network import network_u, UnetClassicAvgLinear3d
-from network import network_u, UnetClassicAvgLinear3d, spatial_configuration_net
-from tensorflow_train.train_loop import MainLoopBase
-from tensorflow_train.utils.tensorflow_util import create_placeholders_tuple
+# The networks are inside the .onnx files. These names are only passed through to InferenceLoop1/2/3.
+network_u = UnetClassicAvgLinear3d = spatial_configuration_net = None
 from utils.segmentation.segmentation_test import SegmentationTest
 from utils.sitk_np import np_to_sitk
 import utils.np_image
@@ -54,11 +65,19 @@ EXIT_OUT_OF_MEMORY = -3
 EXIT_NO_VERTEBRA = -4
 EXIT_MODEL_NOT_FOUND = -5
 EXIT_MODEL_LOAD = -6
-EXIT_DRIVER_OLD = -8
+EXIT_DRIVER_OLD = -8              # no longer used (CPU only); kept so that the exit codes stay the same
 
-CUDA_DRIVER_MIN_VERSION = 10000  # CUDA 10.0 (required by tensorflow-gpu 1.15)
-GPU_CC_MIN = (3, 5)              # oldest GPU generation supported by tensorflow-gpu 1.15
-GPU_CC_MAX = (7, 5)              # newest GPU generation verified with this build (Turing)
+# Seed of the random numbers of the MC dropout (stage 3). ONNX Runtime gives the dropout layers the seeds
+# ONNX_RANDOM_SEED, +1, +2, ... and each session continues its sequence over the uncert_cal_times runs and the
+# vertebrae, so the masks still differ between layers and runs, but the same CT gives the same result every time.
+# (Without a fixed seed ONNX Runtime takes it from the clock, and every run differs slightly, as with TF.)
+ONNX_RANDOM_SEED = 2026
+
+# --no_dropout: stage 3 uses '<model_files3 prefix>' + NO_DROPOUT_SUFFIX + '.onnx', the same network with dropout
+# off (made by freeze_vertebrae_onnx.py / convert_pb_to_onnx.py as 3_vertebrae_segmentation_<i>_check.onnx), and
+# runs it once per vertebra. The result is deterministic and stage 3 is about 10 times faster, but it is NOT the
+# MC dropout method of the original program: evaluate it before using it.
+NO_DROPOUT_SUFFIX = '_nodropout'
 
 
 class SegmentError(Exception):
@@ -82,13 +101,27 @@ class ModelLoadError(SegmentError):
     exit_code = EXIT_MODEL_LOAD
 
 
-class DriverTooOldError(SegmentError):
-    exit_code = EXIT_DRIVER_OLD
+class SetupFolderError(SegmentError):
+    exit_code = EXIT_FAILURE
+
+
+def check_setup_folder(setup_folder, protected_paths):
+    """--setup_folder is deleted (shutil.rmtree) at the start and at the end of the run, so it must be a folder
+    used only for intermediate files. Refuse it if it is, or contains, the current folder, the folder of this
+    script / exe, a drive root, or any input, output or model path."""
+    setup = os.path.normcase(os.path.realpath(setup_folder))
+    if os.path.dirname(setup) == setup:
+        raise SetupFolderError('setup_folder must not be a drive root: {}'.format(setup_folder))
+    for path in protected_paths:
+        p = os.path.normcase(os.path.realpath(path))
+        if p == setup or p.startswith(setup.rstrip(os.sep) + os.sep):
+            raise SetupFolderError('setup_folder must be a separate folder for intermediate files '
+                                   '(it is deleted after the run), but it contains: {}'.format(path))
 
 
 def is_out_of_memory(e):
     """True if the exception means out of memory (CPU RAM or GPU VRAM)."""
-    if isinstance(e, (MemoryError, tf.errors.ResourceExhaustedError)):
+    if isinstance(e, MemoryError):
         return True
     msg = str(e).lower()
     return ('out of memory' in msg                # CUDA
@@ -109,70 +142,17 @@ def get_exit_code(e):
     return EXIT_FAILURE
 
 
-def check_gpu():
-    """
-    Check the NVIDIA driver and the selected GPU (call after CUDA_VISIBLE_DEVICES is set; the selected GPU is index 0).
-    Uses the CUDA driver API directly, so no GPU memory is allocated.
-    :return: True if the GPU can be used. False -> run on CPU.
-    :raise DriverTooOldError: The NVIDIA driver does not support CUDA 10.0.
-    """
-    try:
-        cuda = ctypes.WinDLL('nvcuda.dll') if os.name == 'nt' else ctypes.CDLL('libcuda.so.1')
-    except OSError:
-        print('NVIDIA driver not found.')
-        return False
-
-    version = ctypes.c_int(0)
-    if cuda.cuDriverGetVersion(ctypes.byref(version)) != 0:
-        print('Cannot get NVIDIA driver version.')
-        return False
-    print('NVIDIA driver: CUDA {}.{}'.format(version.value // 1000, (version.value % 1000) // 10))
-    if version.value < CUDA_DRIVER_MIN_VERSION:
-        raise DriverTooOldError('NVIDIA driver is too old for this build (CUDA 10.0 required, driver supports CUDA {}.{})'.format(
-            version.value // 1000, (version.value % 1000) // 10))
-
-    if cuda.cuInit(0) != 0:
-        print('CUDA initialization failed (no GPU?).')
-        return False
-    count = ctypes.c_int(0)
-    if cuda.cuDeviceGetCount(ctypes.byref(count)) != 0 or count.value < 1:
-        print('No CUDA GPU found.')
-        return False
-    device = ctypes.c_int(0)
-    if cuda.cuDeviceGet(ctypes.byref(device), 0) != 0:
-        print('Cannot get CUDA GPU.')
-        return False
-    major = ctypes.c_int(0)
-    minor = ctypes.c_int(0)
-    name = ctypes.create_string_buffer(256)
-    cuda.cuDeviceGetAttribute(ctypes.byref(major), 75, device)  # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR
-    cuda.cuDeviceGetAttribute(ctypes.byref(minor), 76, device)  # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR
-    cuda.cuDeviceGetName(name, len(name), device)
-    capability = (major.value, minor.value)
-    print('GPU name: {} (sm_{}{})'.format(name.value.decode(errors='replace'), major.value, minor.value))
-
-    if not (GPU_CC_MIN <= capability <= GPU_CC_MAX):
-        print('GPU sm_{}{} is not supported by this build (supported: sm_{}{} - sm_{}{}).'.format(
-            major.value, minor.value, GPU_CC_MIN[0], GPU_CC_MIN[1], GPU_CC_MAX[0], GPU_CC_MAX[1]))
-        return False
-    return True
-
-
-def use_cpu_only():
-    """
-    Make TensorFlow ignore all GPUs (must be called before the first tf.Session is created).
-    CUDA_VISIBLE_DEVICES cannot be used here because it is fixed when CUDA is initialized in check_gpu().
-    TensorFlow ignores GPUs with fewer multiprocessors than TF_MIN_GPU_MULTIPROCESSOR_COUNT.
-    """
-    os.environ['TF_MIN_GPU_MULTIPROCESSOR_COUNT'] = '100000'
+def onnx_path(prefix):
+    """Model file for a --model_filesN prefix: '<prefix>.onnx' (the prefix may also be given with .onnx)."""
+    return prefix if prefix.lower().endswith('.onnx') else prefix + '.onnx'
 
 
 def check_model_files(model_files_list):
-    """Check that all TensorFlow checkpoint files exist (<prefix>.index and <prefix>.data-*)."""
+    """Check that all ONNX model files exist (<prefix>.onnx)."""
     for model_files in model_files_list:
         for prefix in model_files:
-            if not os.path.isfile(prefix + '.index') or not glob(glob_escape(prefix) + '.data-*'):
-                raise ModelNotFoundError('Model file not found: {}'.format(prefix))
+            if not os.path.isfile(onnx_path(prefix)):
+                raise ModelNotFoundError('Model file not found: {}'.format(onnx_path(prefix)))
 
 
 def convert_mhd_to_nii(mhd_path, nii_path):
@@ -203,16 +183,60 @@ def convert_nii_to_mhd(nii_path, mhd_path):
     sitk.WriteImage(nimg, mhd_path)
 
 
-class MainLoopChecked(MainLoopBase):
-    """MainLoopBase with model load errors reported as ModelLoadError."""
-    def load_model(self):
-        try:
-            super().load_model()
-        except Exception as e:
-            if is_out_of_memory(e):
-                raise
-            raise ModelLoadError('Model load error: {}: {}'.format(self.load_model_filename, e)) from e
+class _NoSession(object):
+    """Stands in for tf.Session so that `loopN.network_loop.sess.close()` in __main__ keeps working:
+    close() releases the ONNX Runtime sessions of that stage."""
+    def __init__(self, sessions):
+        self.sessions = sessions
 
+    def close(self):
+        self.sessions.clear()
+
+
+class MainLoopOnnx(object):
+    """TensorFlow-free replacement of MainLoopBase: runs one exported ONNX model on the CPU.
+
+    The ONNX models (network structure + weights) are made from the TF checkpoints with
+    freeze_vertebrae_onnx.py and convert_pb_to_onnx.py; the network code of network.py is inside them.
+    Sessions are created once per model file and kept: besides being faster, this matters for MC dropout
+    (stage 3), because a new session restarts the random generator."""
+    def __init__(self):
+        self._sessions = {}                         # path -> onnxruntime.InferenceSession
+        self.sess = _NoSession(self._sessions)
+        self.load_model_filename = None
+        self.model = None
+        self.input_names = []
+
+    # called by InferenceLoop1/2/3; nothing to build any more, the graph is inside the .onnx file
+    def init_networks(self):
+        pass
+
+    def init_variables(self):
+        pass
+
+    def init_saver(self):
+        pass
+
+    def load_model(self):
+        path = onnx_path(self.load_model_filename)
+        if path not in self._sessions:
+            print('Restoring model ' + path)
+            try:
+                self._sessions[path] = ort.InferenceSession(path, providers=['CPUExecutionProvider'])
+            except Exception as e:
+                if is_out_of_memory(e):
+                    raise
+                raise ModelLoadError('Model load error: {}: {}'.format(path, e)) from e
+        self.model = self._sessions[path]
+        self.input_names = [i.name for i in self.model.get_inputs()]
+
+    def run(self, **arrays):
+        """run(image=..., single_heatmap=...) -> first output. Input names are 'placeholder_<key>:0'."""
+        feed = {}
+        for name in self.input_names:
+            key = name.split(':')[0].replace('placeholder_', '')
+            feed[name] = np.ascontiguousarray(arrays[key], dtype=np.float32)
+        return self.model.run(None, feed)[0]
 
 
 def reorient_to_rai(image):
@@ -232,46 +256,17 @@ def reorient_to_rai(image):
     
 
 
-class MainLoop1(MainLoopChecked):
+class MainLoop1(MainLoopOnnx):
     def __init__(self, network, unet, network_parameters, image_size, image_spacing, data_format):
         super().__init__()
         self.num_labels = 1
         self.data_format = data_format
-        self.channel_axis = 1
-        self.network = network
-        self.unet = unet
-        self.network_parameters = network_parameters
-        self.padding = 'same'
         self.image_size = image_size
         self.image_spacing = image_spacing
 
-    def init_networks(self):
-        network_image_size = list(reversed(self.image_size))
-
-        if self.data_format == 'channels_first':
-            data_generator_entries = OrderedDict([('image', [1] + network_image_size),
-                                                  ('spine_heatmap', [1] + network_image_size)
-                                                  ])
-        else:
-            data_generator_entries = OrderedDict([('image', network_image_size + [1]),
-                                                  ('spine_heatmap', network_image_size + [1])])
-
-        data_generator_types = {'image': tf.float32,
-                                'spine_heatmap': tf.float32}
-
-        # create model with shared weights between train and val
-        training_net = tf.make_template('net', self.network)
-
-        # build val graph
-        self.data_val, self.target_spine_heatmap_val = create_placeholders_tuple(data_generator_entries, data_types=data_generator_types, shape_prefix=[1])
-        self.prediction_val = training_net(self.data_val, num_labels=self.num_labels, is_training=False, actual_network=self.unet, padding=self.padding, data_format=self.data_format, **self.network_parameters)
-
     def test_full_image(self, image):
-        feed_dict = {self.data_val: np.expand_dims(image, axis=0)}
-        # run loss and update loss accumulators
-        run_tuple = self.sess.run((self.prediction_val,), feed_dict=feed_dict)
-        prediction = np.squeeze(run_tuple[0], axis=0)
-        return prediction
+        prediction = self.run(image=np.expand_dims(image, axis=0))
+        return np.squeeze(prediction, axis=0)
 
 
 class InferenceLoop1(object):
@@ -395,36 +390,14 @@ class InferenceLoop1(object):
 
 
 
-class MainLoop2(MainLoopChecked):
+class MainLoop2(MainLoopOnnx):
     def __init__(self, network, unet, network_parameters, image_size, image_spacing, cropped_inc, data_format):
         super().__init__()
         self.num_labels = 25
         self.data_format = data_format
-        self.channel_axis = 1
-        self.network = network
-        self.unet = unet
-        self.network_parameters = network_parameters
-        self.padding = 'same'
         self.image_size = image_size
         self.image_spacing = image_spacing
         self.cropped_inc = cropped_inc
-
-    def init_networks(self):
-        network_image_size = list(reversed(self.image_size))
-
-        if self.data_format == 'channels_first':
-            data_generator_entries = OrderedDict([('image', [1] + network_image_size)])
-        else:
-            data_generator_entries = OrderedDict([('image', network_image_size + [1])])
-
-        data_generator_types = {'image': tf.float32}
-
-        # create model with shared weights between train and val
-        training_net = tf.make_template('net', self.network)
-
-        # build val graph
-        self.data_val = create_placeholders_tuple(data_generator_entries, data_types=data_generator_types, shape_prefix=[1])
-        self.prediction_val, self.local_prediction_val, self.spatial_prediction_val = training_net(self.data_val, num_labels=self.num_labels, is_training=False, actual_network=self.unet, padding=self.padding, data_format=self.data_format, **self.network_parameters)
 
     def test_cropped_image(self, full_image):
         image_size_np = [1] + list(reversed(self.image_size)) if self.data_format == 'channels_first' else list(reversed(self.image_size)) + [1]
@@ -436,9 +409,7 @@ class MainLoop2(MainLoopChecked):
 
         for image_tiler, prediction_tiler in zip(image_tiler, prediction_tiler):
             current_image = image_tiler.get_current_data(full_image)
-            feed_dict = {self.data_val: np.expand_dims(current_image, axis=0)}
-            run_tuple = self.sess.run((self.prediction_val,), feed_dict=feed_dict)
-            prediction = np.squeeze(run_tuple[0], axis=0)
+            prediction = np.squeeze(self.run(image=np.expand_dims(current_image, axis=0)), axis=0)
             image_tiler.set_current_data(current_image)
             prediction_tiler.set_current_data(prediction)
 
@@ -617,50 +588,19 @@ class InferenceLoop2(object):
             writer.writerow(indata[0])
 
 
-class MainLoop3(MainLoopChecked):
+class MainLoop3(MainLoopOnnx):
     def __init__(self, network, unet, network_parameters, image_size, image_spacing, data_format):
         super().__init__()
         self.num_labels = 1
         self.num_labels_all = 26
         self.data_format = data_format
-        self.network = network
-        self.unet = unet
-        self.network_parameters = network_parameters
-        self.padding = 'same'
         self.image_size = image_size
         self.image_spacing = image_spacing
 
-    def init_networks(self):
-        network_image_size = list(reversed(self.image_size))
-
-        if self.data_format == 'channels_first':
-            data_generator_entries = OrderedDict([('image', [1] + network_image_size),
-                                                  ('single_heatmap', [1] + network_image_size)])
-        else:
-            data_generator_entries = OrderedDict([('image', network_image_size + [1]),
-                                                  ('single_heatmap', network_image_size + [1])])
-
-        data_generator_types = {'image': tf.float32, 'single_heatmap': tf.float32}
-
-
-        # create model with shared weights between train and val
-        training_net = tf.make_template('net', self.network)
-
-        # build val graph
-        self.data_val, self.single_heatmap_val = create_placeholders_tuple(data_generator_entries, data_types=data_generator_types, shape_prefix=[1])
-        concat_axis = 1 if self.data_format == 'channels_first' else 4
-        self.data_heatmap_concat_val = tf.concat([self.data_val, self.single_heatmap_val], axis=concat_axis)
-        self.prediction_val = training_net(self.data_heatmap_concat_val, num_labels=self.num_labels, is_training=True, actual_network=self.unet, padding=self.padding, data_format=self.data_format, **self.network_parameters)
-        self.prediction_softmax_val = tf.nn.sigmoid(self.prediction_val)
-
     def test_full_image(self, image, heatmap):
-        feed_dict = {self.data_val: np.expand_dims(image, axis=0),
-                     self.single_heatmap_val: np.expand_dims(heatmap, axis=0)}
-        # run loss and update loss accumulators
-        run_tuple = self.sess.run((self.prediction_softmax_val,), feed_dict=feed_dict)
-        prediction = np.squeeze(run_tuple[0], axis=0)
-
-        return prediction
+        # the exported model already contains the sigmoid and keeps dropout on (MC dropout)
+        prediction = self.run(image=np.expand_dims(image, axis=0), single_heatmap=np.expand_dims(heatmap, axis=0))
+        return np.squeeze(prediction, axis=0)
 
 
 class InferenceLoop3(object):
@@ -701,6 +641,11 @@ class InferenceLoop3(object):
                               'save_debug_images': self.save_debug_images}
 
         dataset = Dataset(**dataset_parameters)
+        # [Speed-up] dataset_val() uses the uncached image data source, which loads the CT (.nii.gz) and smooths it
+        # (Gaussian, input_gaussian_sigma) again for every vertebra. Use the cached data source instead: the same
+        # image is loaded and smoothed once and reused (identical data; it is released with loop3).
+        uncached_datasources = dataset.datasources
+        dataset.datasources = lambda iterator, cached: uncached_datasources(iterator, True)
         self.dataset_val = dataset.dataset_val()
 
         self.network_loop = MainLoop3(network, unet, network_parameters, self.image_size, self.image_spacing, self.data_format)
@@ -834,23 +779,54 @@ class InferenceLoop3(object):
                         utils.io.image.write_multichannel_np(patch_cal_uncert_np, os.path.join(file_save_folder, image_id + '_' + landmark_id + 'uncert.mha'), data_format=self.data_format, image_type=np.double, spacing=self.image_spacing, origin=origin)
 
                     # Segmentation mask calculation processing
-                    prediction_resampled_sitk = utils.sitk_image.transform_np_output_to_sitk_input(output_image=patch_cal_label_np,
-                                                                                        output_spacing=self.image_spacing,
-                                                                                        channel_axis=channel_axis,
-                                                                                        input_image_sitk=input_image,
-                                                                                        transform=transformation,
-                                                                                        interpolator=interpolator,
-                                                                                        output_pixel_type=sitk.sitkFloat32)
+                    # [Speed-up] Resample the prediction only into the part of the input image that this patch
+                    # covers. Outside it the full-size resampling gave 0, which never wins against best_prob_np
+                    # (>= 0.5), so the result is the same; the work drops from the whole CT to about the patch.
+                    region = patch_region_in_input(input_image, transformation, self.image_size, self.image_spacing)
+                    current_prob_np, sl = None, None
+                    if region is not None:
+                        start, size = region
+                        prediction_resampled_sitk = utils.sitk_image.transform_np_output_to_input(
+                            output_image=patch_cal_label_np,
+                            output_spacing=self.image_spacing,
+                            channel_axis=channel_axis,
+                            input_image_size=size,
+                            input_image_spacing=input_image.GetSpacing(),
+                            input_image_origin=input_image.TransformIndexToPhysicalPoint(start),
+                            input_image_direction=input_image.GetDirection(),
+                            transform=transformation,
+                            interpolator=interpolator,
+                            output_pixel_type=sitk.sitkFloat32)
+                        current_prob_np = utils.sitk_np.sitk_to_np_no_copy(prediction_resampled_sitk[0]).astype(np.float16)
+                        del prediction_resampled_sitk
+                        if region_border_is_zero(current_prob_np, start, size, input_image.GetSize()):
+                            sl = (slice(start[2], start[2] + size[2]), slice(start[1], start[1] + size[1]),
+                                  slice(start[0], start[0] + size[0]))
+                        else:                               # should not happen: fall back to the whole image
+                            print('  (landmark {}: patch region check failed, resampling the whole image)'.format(landmark_id))
+                            current_prob_np = None
+                    if region is not None and current_prob_np is None:
+                        prediction_resampled_sitk = utils.sitk_image.transform_np_output_to_sitk_input(output_image=patch_cal_label_np,
+                                                                                            output_spacing=self.image_spacing,
+                                                                                            channel_axis=channel_axis,
+                                                                                            input_image_sitk=input_image,
+                                                                                            transform=transformation,
+                                                                                            interpolator=interpolator,
+                                                                                            output_pixel_type=sitk.sitkFloat32)
+                        current_prob_np = utils.sitk_np.sitk_to_np_no_copy(prediction_resampled_sitk[0]).astype(np.float16)
+                        del prediction_resampled_sitk
+                        sl = (slice(None), slice(None), slice(None))
 
                     # [Memory fix] Running argmax (equivalent to the former argmax over 26 float16 channels).
                     # Cast to float16 first so that comparisons are identical to the former float16 array.
                     # A strict '>' keeps the lower label on ties, same as np.argmax.
-                    current_prob_np = utils.sitk_np.sitk_to_np_no_copy(prediction_resampled_sitk[0]).astype(np.float16)
-                    del prediction_resampled_sitk
-                    update_mask_np = current_prob_np > best_prob_np
-                    np.copyto(best_prob_np, current_prob_np, where=update_mask_np)
-                    np.copyto(best_label_np, np.uint8(int(landmark_id) + 1), where=update_mask_np)
-                    del current_prob_np, update_mask_np
+                    if current_prob_np is not None:         # None: patch completely outside the image, nothing to do
+                        best_prob_view = best_prob_np[sl]       # views: updated in place
+                        best_label_view = best_label_np[sl]
+                        update_mask_np = current_prob_np > best_prob_view
+                        np.copyto(best_prob_view, current_prob_np, where=update_mask_np)
+                        np.copyto(best_label_view, np.uint8(int(landmark_id) + 1), where=update_mask_np)
+                        del current_prob_np, update_mask_np, best_prob_view, best_label_view
 
                     # [Memory fix] Uncertainty map resampling removed (its result was never written)
 
@@ -880,6 +856,38 @@ class InferenceLoop3(object):
                 # Errors are classified and reported in __main__
                 print('ERROR predicting (Vertebrae Segmentation)', image_id)
                 raise
+
+
+def patch_region_in_input(input_image, transformation, patch_size, patch_spacing, margin=2):
+    """Region (start, size) [x, y, z] of the input image grid that the patch can reach when the patch is resampled
+    back to the input image (linear interpolation). Outside this region the resampled value is the default 0.
+    The patch corners (continuous index -0.5 and size - 0.5, i.e. the limits ITK interpolates in) are mapped with
+    the patch -> input transformation (translations / affine for the test data) and widened by `margin` voxels.
+    Returns None if the patch lies completely outside the input image."""
+    corners = []
+    for ix in (-0.5, patch_size[0] - 0.5):
+        for iy in (-0.5, patch_size[1] - 0.5):
+            for iz in (-0.5, patch_size[2] - 0.5):
+                q = (ix * patch_spacing[0], iy * patch_spacing[1], iz * patch_spacing[2])
+                corners.append(input_image.TransformPhysicalPointToContinuousIndex(transformation.TransformPoint(q)))
+    corners = np.array(corners)
+    full = input_image.GetSize()
+    start = np.maximum(np.floor(corners.min(axis=0)).astype(int) - margin, 0)
+    end = np.minimum(np.ceil(corners.max(axis=0)).astype(int) + margin, np.array(full) - 1)
+    if np.any(end < start):
+        return None
+    return [int(v) for v in start], [int(v) for v in end - start + 1]
+
+
+def region_border_is_zero(region_np, start, size, full_size):
+    """True if the resampled region is 0 on every face that is not on the border of the whole image, i.e. nothing of
+    the patch was cut off by the region (safety check of patch_region_in_input)."""
+    for k, axis in enumerate((2, 1, 0)):                     # numpy axis k <-> [x, y, z] index `axis`
+        if start[axis] > 0 and np.any(np.take(region_np, 0, axis=k)):
+            return False
+        if start[axis] + size[axis] < full_size[axis] and np.any(np.take(region_np, -1, axis=k)):
+            return False
+    return True
 
 
 def reorient_to_reference(image, reference):
@@ -952,28 +960,45 @@ if __name__ == '__main__':
     parser.add_argument('--model_files3', nargs='+', type=str, required=True)
     parser.add_argument('--output_folder', type=str, required=True)
     parser.add_argument('--base_name', type=str, required=True)
-    parser.add_argument('--gpu', type=str, default='0')
+    parser.add_argument('--gpu', type=str, default='0')   # ignored (CPU only), kept for MF
+    parser.add_argument('--no_dropout', action='store_true',
+                        help='stage 3 without MC dropout: one run per vertebra with <prefix>%s.onnx' % NO_DROPOUT_SUFFIX)
+    parser.add_argument('--mc_runs', type=int, default=10,
+                        help='evaluation: MC dropout runs per vertebra in stage 3 (default 10, as the original program)')
+    parser.add_argument('--seed', type=int, default=ONNX_RANDOM_SEED,
+                        help='evaluation: random seed of the MC dropout (default %d)' % ONNX_RANDOM_SEED)
     parser_args = parser.parse_args()
+    if parser_args.mc_runs < 1:
+        parser.error('--mc_runs must be 1 or more')
+    if parser_args.no_dropout and parser_args.mc_runs != 10:
+        parser.error('--no_dropout always runs once per vertebra; do not combine it with --mc_runs')
+    if parser_args.no_dropout:
+        parser_args.model_files3 = [p[:-len('.onnx')] if p.lower().endswith('.onnx') else p
+                                    for p in parser_args.model_files3]
+        parser_args.model_files3 = [p + NO_DROPOUT_SUFFIX for p in parser_args.model_files3]
+    setup_folder_checked = False   # the setup folder is deleted only after it passed check_setup_folder()
 
     try:
+        # setup_folder is deleted below: never accept a folder that holds anything else
+        script_dir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
+        check_setup_folder(parser_args.setup_folder,
+                           [os.getcwd(), script_dir, parser_args.image_folder, parser_args.output_folder]
+                           + [onnx_path(p) for p in parser_args.model_files1 + parser_args.model_files2 + parser_args.model_files3])
+        setup_folder_checked = True
+
         log_path = os.path.join(parser_args.output_folder, (parser_args.base_name + '_ailog.txt'))
         with open(log_path, mode="w") as f:
             f.write("10")
 
-        os.environ['CUDA_VISIBLE_DEVICES'] = parser_args.gpu
-
-        # GPU / NVIDIA driver check (driver too old -> exit -8, unsupported or no GPU -> run on CPU)
-        if parser_args.gpu.strip() != '-1':
-            print('--------------------')
-            print(' GPU mode (GPU: {})'.format(parser_args.gpu))
-            if not check_gpu():
-                print(' -> Run on CPU')
-                use_cpu_only()
-            print('--------------------')
-        else:
-            print('--------------------')
-            print(' CPU mode ')
-            print('--------------------')
+        # ONNX Runtime, CPU only (--gpu is ignored)
+        print('--------------------')
+        print(' CPU mode (ONNX Runtime {})'.format(ort.__version__))
+        ort.set_seed(parser_args.seed)      # before any session is created: reproducible MC dropout
+        if parser_args.no_dropout:
+            print(' Stage 3: no dropout, 1 run per vertebra ({})'.format(onnx_path(parser_args.model_files3[0])))
+        elif parser_args.mc_runs != 10 or parser_args.seed != ONNX_RANDOM_SEED:
+            print(' Stage 3: MC dropout, {} runs per vertebra, seed {}'.format(parser_args.mc_runs, parser_args.seed))
+        print('--------------------')
 
         # Model files check (not found -> exit -5)
         check_model_files([parser_args.model_files1, parser_args.model_files2, parser_args.model_files3])
@@ -1028,7 +1053,6 @@ if __name__ == '__main__':
         loop1.network_loop.sess.close()
         del loop1
         gc.collect()
-        tf.reset_default_graph()
 
         with open(log_path, mode="w") as f:
             f.write("20")
@@ -1041,7 +1065,6 @@ if __name__ == '__main__':
         loop2.network_loop.sess.close()
         del loop2
         gc.collect()
-        tf.reset_default_graph()
 
         with open(log_path, mode="w") as f:
             f.write("25")
@@ -1054,12 +1077,15 @@ if __name__ == '__main__':
         result_folder = 'vertebrae_bayesian_segmentation_rai'
             
         loop3 = InferenceLoop3(network_u, UnetClassicAvgLinear3d, network_parameters3, parser_args.setup_folder, parser_args.setup_folder, parser_args.model_files3, os.path.join(parser_args.setup_folder, result_folder), log_path, parser_args.base_name)
+        if parser_args.no_dropout:
+            loop3.uncert_cal_times = 1      # the network has no dropout: every run would give the same output
+        else:
+            loop3.uncert_cal_times = parser_args.mc_runs
         loop3.test()
         # [Memory fix] Release session and cached images of loop3
         loop3.network_loop.sess.close()
         del loop3
         gc.collect()
-        tf.reset_default_graph()
 
         with open(log_path, mode="w") as f:
             f.write("90")
@@ -1112,5 +1138,6 @@ if __name__ == '__main__':
 
     finally:
         # Remove intermediate files also on failure
-        shutil.rmtree(parser_args.setup_folder, ignore_errors=True)
+        if setup_folder_checked:
+            shutil.rmtree(parser_args.setup_folder, ignore_errors=True)
 

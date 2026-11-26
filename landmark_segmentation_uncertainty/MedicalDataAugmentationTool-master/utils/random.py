@@ -1,3 +1,4 @@
+# Modified by RCCM, 2026-11: np.bool -> bool (np.bool was removed in NumPy 1.24)
 
 import numpy as np
 
@@ -67,5 +68,5 @@ def bool_bernoulli(p=0.5, size=None):
     """
     values = np.random.binomial(n=1, p=p, size=size)
     if isinstance(values, np.ndarray):
-        return values.astype(np.bool)
+        return values.astype(bool)
     return bool(values)
